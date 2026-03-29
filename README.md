@@ -5,6 +5,23 @@ This fork project, and **ITQ3_S** (Interleaved Ternary Quantization - Specialize
 
 Unlike conventional 3-bit methods that sacrifice logic for compression, ITQ3_S integrates **TurboQuant** technology. By applying a **Fast Walsh-Hadamard Transform (FWHT)** in the rotation domain, it flattens weight distributions and suppresses quantization noise. This allows enthusiasts and developers to run massive models locally with near-FP16 reasoning capabilities.
 
+### 1.1. Core Workflow: TurboQuant + IQ3_S
+
+**1. Offline Quantization:**
+The weights are transformed, quantized, and stored:
+$$\hat{\mathbf{w}} = Q(H \cdot \mathbf{w})$$
+
+**2. Online Inference:**
+The stored weights $\hat{\mathbf{w}}$ are dequantized and inverse-transformed **on-the-fly** before the matrix multiplication (with input vector $\mathbf{x}$):
+$$\mathbf{y} = (H^{-1} \cdot \hat{\mathbf{w}}) \cdot \mathbf{x} = (0.0625 \cdot H \cdot \hat{\mathbf{w}}) \cdot \mathbf{x}$$
+
+By fusing $H^{-1}$ directly into the CUDA kernel's shared memory loading stage, we achieve high-fidelity inference with virtually no speed penalty on RTX 5090.
+
+```ascii
+Quntize: W → FWHT → quant (IQ3_S)
+Inference: dequant → IFWHT (CPU or naive GPU) → matmul
+```
+
 ### 1.2. Why ITQ3_S for Local Inference?
 - **Consumer-First Engineering**: Designed to squeeze every Teraflop and GB/s out of the RTX 5090's Blackwell architecture.
 - **Breaking the 3-bit Barrier**: Traditionally, 3-bit was the "breaking point" for model logic. ITQ3_S restores this lost intelligence through mathematical rotation.
