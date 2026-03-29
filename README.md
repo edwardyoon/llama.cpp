@@ -1,7 +1,20 @@
 # ITQ3_S: Interleaved Ternary Quantization with TurboQuant (3-bit)
 
 ## 1. Overview
-**ITQ3_S** is a high-fidelity 3-bit quantization format that integrates **TurboQuant** technology. Unlike standard 3-bit formats, it applies a **Fast Walsh-Hadamard Transform (FWHT)** in the rotation domain to flatten the weight distribution, significantly reducing quantization error while maintaining computational efficiency on modern GPUs (e.g., RTX 5090).
+This fork project, and **ITQ3_S** (Interleaved Ternary Quantization - Specialized) is a high-fidelity 3-bit format engineered to **maximize LLM performance on consumer-grade local hardware**, specifically targeting the **NVIDIA RTX 5090**. 
+
+Unlike conventional 3-bit methods that sacrifice logic for compression, ITQ3_S integrates **TurboQuant** technology. By applying a **Fast Walsh-Hadamard Transform (FWHT)** in the rotation domain, it flattens weight distributions and suppresses quantization noise. This allows enthusiasts and developers to run massive models locally with near-FP16 reasoning capabilities.
+
+### 1.2. Why ITQ3_S for Local Inference?
+- **Consumer-First Engineering**: Designed to squeeze every Teraflop and GB/s out of the RTX 5090's Blackwell architecture.
+- **Breaking the 3-bit Barrier**: Traditionally, 3-bit was the "breaking point" for model logic. ITQ3_S restores this lost intelligence through mathematical rotation.
+- **Maximum Assetization**: Empowers individual users to own and operate high-parameter models on a single-node home office setup without relying on cloud APIs.
+- **Zero-Compromise Speed**: Optimized CUDA kernels ensure that the added mathematical precision (256-point IFWHT) does not bottleneck the RTX 5090's massive throughput.
+
+### 1.3. Core Technology: TurboQuant for Local GPUs
+To achieve extreme fidelity on small-scale local deployments, we focus on:
+1. **Rotation-Domain Smoothing**: Outlier weights, which usually destroy 3-bit precision, are "spread" across the vector using FWHT.
+2. **Synchronized Inference**: We implement a **256-point Inverse FWHT** directly in CUDA shared memory, ensuring the engine perfectly reverses the specialized quantization applied during model creation.
 
 ## 2. Key Features
 - **Rotation-Domain Quantization**: Minimizes outliers by transforming weights into a Gaussian-like distribution using FWHT.
