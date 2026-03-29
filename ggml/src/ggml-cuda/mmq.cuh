@@ -19,6 +19,10 @@ typedef void (*vec_dot_mmq_t)(const int * __restrict__ x, const int * __restrict
 typedef void (*mmq_write_back_t)(const float * __restrict__ sum, const int32_t * __restrict__ get_rows_to_sorted,
     float * __restrict__ dst, const int stride, const int i_max, const int j_max);
 
+template <int mmq_y, bool need_check>
+static __device__ __forceinline__ void load_tiles_itq3_s(
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride);
+
 enum mmq_q8_1_ds_layout {
     MMQ_Q8_1_DS_LAYOUT_D4,
     MMQ_Q8_1_DS_LAYOUT_DS4,
@@ -81,6 +85,7 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
         case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_XXS:
         case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_ITQ3_S: // 추가: IQ3_S와 동일한 레이아웃 사용
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_IQ1_S:
             return MMQ_Q8_1_DS_LAYOUT_DS4;
@@ -199,6 +204,7 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_IQ2_S:   return MMQ_DP4A_TXS_Q8_0_16;
         case GGML_TYPE_IQ3_XXS: return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_IQ3_S:   return MMQ_DP4A_TXS_Q8_0;
+        case GGML_TYPE_ITQ3_S:  return MMQ_DP4A_TXS_Q8_0; // 추가
         case GGML_TYPE_IQ1_S:   return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_IQ4_XS:  return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_IQ4_NL:  return MMQ_DP4A_TXS_Q8_0;
@@ -240,6 +246,7 @@ static constexpr __host__ __device__ int mmq_get_mma_tile_x_k(ggml_type type) {
         case GGML_TYPE_IQ2_S:   return MMQ_MMA_TILE_X_K_Q3_K;
         case GGML_TYPE_IQ3_XXS: return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_IQ3_S:   return MMQ_MMA_TILE_X_K_Q8_0;
+        case GGML_TYPE_ITQ3_S:  return MMQ_MMA_TILE_X_K_Q8_0; // 추가: 5090 텐서 코어 타일링 적용
         case GGML_TYPE_IQ1_S:   return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_IQ4_XS:  return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_IQ4_NL:  return MMQ_MMA_TILE_X_K_Q8_0;
@@ -292,6 +299,76 @@ static constexpr __device__ int mmq_get_nwarps_device() {
     return 256/ggml_cuda_get_physical_warp_size();
 #endif // AMD_MFMA_AVAILABLE
 }
+
+
+
+template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_iq3_s(
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + MMQ_TILE_NE_K*2);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_IQ3_S, mmq_y);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+
+    constexpr int threads_per_row = (MMQ_ITER_K / (4 * QR3_S)) / 2;
+    constexpr int nrows = warp_size / threads_per_row;
+    const int kqsx = threadIdx.x % threads_per_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * nrows) {
+        int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_iq3_s * bxi = (const block_iq3_s *) x + kbx0 + i*stride;
+
+        const int2      qs_packed = make_int2(get_int_b2(bxi->qs, 2*kqsx+0), get_int_b2(bxi->qs, 2*kqsx+1));
+        const uint8_t * qs        = (const uint8_t *) &qs_packed;
+
+        const int qh = bxi->qh[kqsx];
+
+        const int       signs_packed_32 = get_int_b2(bxi->signs, kqsx);
+        const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
+
+#pragma unroll
+        for (int l = 0; l < QR3_S; ++l) {
+            const int2 grid_pos = make_int2(
+                iq3s_grid[qs[2*l+0] | ((qh << (8 - 2*l)) & 0x100)],
+                iq3s_grid[qs[2*l+1] | ((qh << (7 - 2*l)) & 0x100)]);
+
+            const int signs0 = __vcmpne4(((signs_packed_8[l] & 0x03) << 7) | ((signs_packed_8[l] & 0x0C) << 21), 0x00000000);
+            const int signs1 = __vcmpne4(((signs_packed_8[l] & 0x30) << 3) | ((signs_packed_8[l] & 0xC0) << 17), 0x00000000);
+
+            const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+            const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + 8*kqsx + (2*l+0)] = grid_l;
+            x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + 8*kqsx + (2*l+1)] = grid_h;
+#else
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 8*kqsx + (2*l+0)] = grid_l;
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 8*kqsx + (2*l+1)] = grid_h;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        }
+
+        const int ls = 1 + 2*((bxi->scales[kqsx/2] >> (((2*kqsx) << 1) & 0x04)) & 0x0F);
+        const float d = bxi->d;
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_df[i*MMQ_MMA_TILE_X_K_Q8_0     + kqsx] = ls*d;
+#else
+        x_df[i*(MMQ_TILE_NE_K/4) + i/4   + kqsx] = ls*d;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    }
+}
+
 
 // ------------------------------------------------------------
 
@@ -2934,71 +3011,95 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
     }
 }
 
-template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_iq3_s(
+template <int mmq_y, bool need_check>
+static __device__ __forceinline__ void load_tiles_itq3_s(
     const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
-    constexpr int nwarps = mmq_get_nwarps_device();
+
+    // 1. IQ3_S 기본 로딩
+    load_tiles_iq3_s<mmq_y, need_check>(x, x_tile, kbx0, i_max, stride);
+
+    constexpr int nwarps    = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
+    // 2. 256-point FWHT를 공유 메모리에서 수행
+    // x_tile에 저장된 데이터 레이아웃:
+    //   MMA  경로: x_qs[i * MMQ_MMA_TILE_X_K_Q8_0 + col], col = 0..63 (64개 int = 256개 int8)
+    //   DP4A 경로: x_qs[i * (2*MMQ_TILE_NE_K + 1) + col], col = 0..63
+    //
+    // 각 행(i)당 64개 int = 256개 int8 값이 있고,
+    // 양자화 시 FWHT는 256개 단위로 했으므로 같은 크기로 역변환해야 함.
+
+    int * x_qs = (int *) x_tile;
+
+    // 공유 메모리: 한 번에 한 행씩 처리, 256개 float
+    __shared__ float smem_fwht[256];
+
+    // 각 warp가 담당하는 행 범위
+    const int rows_per_warp = (mmq_y + nwarps - 1) / nwarps;
+    const int row_start     = threadIdx.y * rows_per_warp;
+    const int row_end       = min(row_start + rows_per_warp, mmq_y);
+
+    for (int i = row_start; i < row_end; ++i) {
+
+        // --- 2a. x_qs에서 int8x4 packed → float 256개로 unpack ---
+        // 한 행에 64개 int, 각 int는 packed int8x4
+        // threadIdx.x (0~31)가 64개 중 32개씩 두 패스로 담당
+        for (int half = 0; half < 2; ++half) {
+            const int col = threadIdx.x + half * warp_size; // 0~63
+
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-    int   * x_qs = (int   *)  x_tile;
-    float * x_df = (float *) (x_qs + MMQ_TILE_NE_K*2);
+            const int packed = x_qs[i * MMQ_MMA_TILE_X_K_Q8_0 + col];
 #else
-    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_IQ3_S, mmq_y);
-    int   * x_qs = (int   *)  x_tile;
-    float * x_df = (float *) (x_qs + txs.qs);
-#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            const int packed = x_qs[i * (2 * MMQ_TILE_NE_K + 1) + col];
+#endif
+            // packed int8x4 → 4개 float, smem_fwht[col*4 + lane]
+            for (int lane = 0; lane < 4; ++lane) {
+                smem_fwht[col * 4 + lane] = (float)(int8_t)((packed >> (lane * 8)) & 0xFF);
+            }
+        }
+        __syncwarp();
 
-    constexpr int threads_per_row = (MMQ_ITER_K / (4 * QR3_S)) / 2;
-    constexpr int nrows = warp_size / threads_per_row;
-    const int kqsx = threadIdx.x % threads_per_row;
-
-#pragma unroll
-    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * nrows) {
-        int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
-
-        if (need_check) {
-            i = min(i, i_max);
+        // --- 2b. 256-point FWHT (warp 32개 스레드로 수행) ---
+        // 각 step마다 128개 butterfly 연산, 스레드당 4개씩 담당
+        for (int step = 1; step < 256; step <<= 1) {
+            for (int j = threadIdx.x; j < 128; j += warp_size) {
+                const int lo = (j / step) * (step * 2) + (j % step);
+                const int hi = lo + step;
+                const float u = smem_fwht[lo];
+                const float v = smem_fwht[hi];
+                smem_fwht[lo] = u + v;
+                smem_fwht[hi] = u - v;
+            }
+            __syncwarp();
         }
 
-        const block_iq3_s * bxi = (const block_iq3_s *) x + kbx0 + i*stride;
-
-        const int2      qs_packed = make_int2(get_int_b2(bxi->qs, 2*kqsx+0), get_int_b2(bxi->qs, 2*kqsx+1));
-        const uint8_t * qs        = (const uint8_t *) &qs_packed;
-
-        const int qh = bxi->qh[kqsx];
-
-        const int       signs_packed_32 = get_int_b2(bxi->signs, kqsx);
-        const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
-
-#pragma unroll
-        for (int l = 0; l < QR3_S; ++l) {
-            const int2 grid_pos = make_int2(
-                iq3s_grid[qs[2*l+0] | ((qh << (8 - 2*l)) & 0x100)],
-                iq3s_grid[qs[2*l+1] | ((qh << (7 - 2*l)) & 0x100)]);
-
-            const int signs0 = __vcmpne4(((signs_packed_8[l] & 0x03) << 7) | ((signs_packed_8[l] & 0x0C) << 21), 0x00000000);
-            const int signs1 = __vcmpne4(((signs_packed_8[l] & 0x30) << 3) | ((signs_packed_8[l] & 0xC0) << 17), 0x00000000);
-
-            const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
-            const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
-
-#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-            x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + 8*kqsx + (2*l+0)] = grid_l;
-            x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + 8*kqsx + (2*l+1)] = grid_h;
-#else
-            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 8*kqsx + (2*l+0)] = grid_l;
-            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 8*kqsx + (2*l+1)] = grid_h;
-#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        // --- 2c. 정규화 1/sqrt(256) = 0.0625 ---
+        for (int j = threadIdx.x; j < 256; j += warp_size) {
+            smem_fwht[j] *= 0.0625f;
         }
+        __syncwarp();
 
-        const int ls = 1 + 2*((bxi->scales[kqsx/2] >> (((2*kqsx) << 1) & 0x04)) & 0x0F);
-        const float d = bxi->d;
+        // --- 2d. float → int8x4 repacking → x_qs에 저장 ---
+        for (int half = 0; half < 2; ++half) {
+            const int col = threadIdx.x + half * warp_size;
+            int packed = 0;
+            for (int lane = 0; lane < 4; ++lane) {
+                const float v = smem_fwht[col * 4 + lane];
+                const int8_t clamped = (int8_t)fmaxf(-128.f, fminf(127.f, v));
+                packed |= ((clamped & 0xFF) << (lane * 8));
+            }
+
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-        x_df[i*MMQ_MMA_TILE_X_K_Q8_0     + kqsx] = ls*d;
+            x_qs[i * MMQ_MMA_TILE_X_K_Q8_0 + col] = packed;
 #else
-        x_df[i*(MMQ_TILE_NE_K/4) + i/4   + kqsx] = ls*d;
-#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            x_qs[i * (2 * MMQ_TILE_NE_K + 1) + col] = packed;
+#endif
+        }
+        __syncwarp();
     }
+
+    // 모든 warp 동기화 (다음 단계 vec_dot 전)
+    __syncthreads();
 }
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_iq1_s(
@@ -3337,6 +3438,14 @@ template <int mmq_x, int mmq_y, bool need_check>
 struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_IQ3_S> {
     static constexpr int              vdr          = VDR_IQ3_S_Q8_1_MMQ;
     static constexpr load_tiles_mmq_t load_tiles   = load_tiles_iq3_s<mmq_y, need_check>;
+    static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_q8_1_mma<mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_D4>;
+    static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>;
+};
+
+template <int mmq_x, int mmq_y, bool need_check>
+struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_ITQ3_S> {
+    static constexpr int              vdr          = VDR_IQ3_S_Q8_1_MMQ;
+    static constexpr load_tiles_mmq_t load_tiles   = load_tiles_itq3_s<mmq_y, need_check>;
     static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_q8_1_mma<mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_D4>;
     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>;
 };
@@ -4079,6 +4188,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_IQ2_XS);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ2_S);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ3_XXS);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ3_S);
+extern DECL_MMQ_CASE(GGML_TYPE_ITQ3_S); // 추가: ITQ3_S 케이스 선언
 extern DECL_MMQ_CASE(GGML_TYPE_IQ1_S);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ4_NL);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);

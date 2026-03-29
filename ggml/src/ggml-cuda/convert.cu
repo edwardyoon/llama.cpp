@@ -5,6 +5,8 @@
 
 #define CUDA_Q8_0_NE_ALIGN 2048
 
+typedef void (*dequantize_row_t)(const void * vx, float * y, int64_t n, cudaStream_t stream);
+
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void dequantize_block(const void * __restrict__ vx, dst_t * __restrict__ y,
         const int64_t ne00, const int64_t ne01,
@@ -387,6 +389,60 @@ static __global__ void dequantize_block_iq3_s(const void * __restrict__ vx, dst_
     }
 }
 
+template <typename dst_t>
+static __global__ void dequantize_block_itq3_s(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const int64_t i   = blockIdx.x;
+    const block_iq3_s * x = (const block_iq3_s *) vx;
+
+    const int64_t tid = threadIdx.x;
+    const int64_t il  = tid / 8;  // 0...3
+    const int64_t ib  = tid % 8;  // 0...7
+
+    dst_t * y = yy + i * QK_K + 32 * ib + 8 * il;
+    const uint8_t * qs = x[i].qs + 8 * ib;
+    const uint8_t * grid1 = (const uint8_t *)(iq3s_grid +
+        (qs[2*il+0] | ((x[i].qh[ib] << (8-2*il)) & 256)));
+    const uint8_t * grid2 = (const uint8_t *)(iq3s_grid +
+        (qs[2*il+1] | ((x[i].qh[ib] << (7-2*il)) & 256)));
+    const float d = (float)x[i].d * (1 + 2*((x[i].scales[ib/2] >> 4*(ib%2)) & 0xf));
+    const uint8_t signs = x[i].signs[4*ib + il];
+
+    float vals[8];
+    for (int j = 0; j < 4; ++j) {
+        vals[j+0] = d * grid1[j] * (signs & kmask_iq2xs[j+0] ? -1.f : 1.f);
+        vals[j+4] = d * grid2[j] * (signs & kmask_iq2xs[j+4] ? -1.f : 1.f);
+    }
+
+    __shared__ float smem[QK_K];  // 256 floats
+    const int base = 32 * ib + 8 * il;
+    for (int j = 0; j < 8; ++j) smem[base + j] = vals[j];
+    __syncthreads();
+
+    for (int step = 1; step < QK_K; step <<= 1) {
+        for (int j = tid; j < QK_K / 2; j += 32) {
+            const int lo = (j / step) * (step * 2) + (j % step);
+            const int hi = lo + step;
+            float u = smem[lo];
+            float v = smem[hi];
+            smem[lo] = u + v;
+            smem[hi] = u - v;
+        }
+        __syncthreads();
+    }
+
+    const float scale = 0.0625f;  // 1/16 = 1/sqrt(256)
+    for (int j = tid; j < QK_K; j += 32) {
+        yy[i * QK_K + j] = (dst_t)(smem[j] * scale);
+    }
+
+}
+
+void dequantize_row_itq3_s_cuda(const void * vx, float * y, int64_t n, cudaStream_t stream) {
+    const int nb = n / QK_K;
+    // 스레드 32개, 공유 메모리 QK_K*sizeof(float) = 1024 bytes
+    dequantize_block_itq3_s<float><<<nb, 32, QK_K*sizeof(float), stream>>>(vx, y);
+}
+
 template<typename dst_t>
 static __global__ void dequantize_block_iq1_s(const void * __restrict__ vx, dst_t * __restrict__ yy) {
 
@@ -710,7 +766,7 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
 }
 
 to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
-    switch (type) {
+    switch ((int)type) {
         case GGML_TYPE_Q4_0:
             return dequantize_row_q4_0_cuda;
         case GGML_TYPE_Q4_1:
@@ -752,6 +808,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_iq4_xs_cuda;
         case GGML_TYPE_IQ3_S:
             return dequantize_row_iq3_s_cuda;
+        case GGML_TYPE_ITQ3_S: // 추가: TurboQuant용 커널 연결
+            return (to_fp16_cuda_t)dequantize_row_itq3_s_cuda;
         case GGML_TYPE_MXFP4:
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_NVFP4:
@@ -805,6 +863,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_iq4_xs_cuda;
         case GGML_TYPE_IQ3_S:
             return dequantize_row_iq3_s_cuda;
+        case GGML_TYPE_ITQ3_S: // 추가: TurboQuant용 커널 연결
+            return (to_fp32_cuda_t)dequantize_row_itq3_s_cuda;
         case GGML_TYPE_MXFP4:
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_NVFP4:

@@ -1052,6 +1052,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ3_S> {
     static constexpr int qi = QI3_S;
 };
 
+template <>
+struct ggml_cuda_type_traits<GGML_TYPE_ITQ3_S> {
+    static constexpr int qk = QK_K;  // IQ3_S와 동일
+    static constexpr int qr = QR3_S;
+    static constexpr int qi = QI3_S;
+};
+
 //////////////////////
 
 struct ggml_cuda_device_info {
