@@ -5,7 +5,7 @@ This fork project, and **ITQ3_S** (Interleaved Ternary Quantization - Specialize
 
 Unlike conventional 3-bit methods that sacrifice logic for compression, ITQ3_S integrates **TurboQuant** technology. By applying a **Fast Walsh-Hadamard Transform (FWHT)** in the rotation domain, it flattens weight distributions and suppresses quantization noise. This allows enthusiasts and developers to run massive models locally with near-FP16 reasoning capabilities.
 
-The main motivation is that applying TurboQuant KV cache compression on top of an already quantized weight model (e.g., IQ3_XSS) introduces compounding quantization errors — weight precision loss and KV cache loss accumulate independently — potentially degrading output quality compared to KV-only compression on full-precision weights. 
+The main motivation is that applying TurboQuant KV cache compression on top of an already quantized weight model (e.g., IQ3) introduces compounding quantization errors — weight precision loss and KV cache loss accumulate independently — potentially degrading output quality compared to KV-only compression on full-precision weights. 
 
 This implies that on consumer-grade GPUs such as the RTX 5090, combining a quantized weight model with TurboQuant KV cache may offer limited practical benefit — the memory savings rarely justify the compounded quality degradation unless context length is the hard bottleneck.
 
