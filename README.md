@@ -4,41 +4,49 @@ https://arxiv.org/abs/2603.27914
 
 ## 1. Overview
 This fork project, and **ITQ3_S** (Interleaved Ternary Quantization - Specialized) is a high-fidelity 3-bit format engineered to **maximize LLM performance on consumer-grade local hardware**, specifically targeting the **NVIDIA RTX 5090** (for my personal project). 
-
 Unlike conventional 3-bit methods that sacrifice logic for compression, ITQ3_S integrates **TurboQuant** technology. By applying a **Fast Walsh-Hadamard Transform (FWHT)** in the rotation domain, it flattens weight distributions and suppresses quantization noise. This allows enthusiasts and developers to run massive models locally with near-FP16 reasoning capabilities.
-
+ 
 The main motivation is that applying TurboQuant KV cache compression on top of an already quantized weight model (e.g., IQ3) introduces compounding quantization errors — weight precision loss and KV cache loss accumulate independently — potentially degrading output quality compared to KV-only compression on full-precision weights. 
-
+ 
 This implies that on consumer-grade GPUs such as the RTX 5090, combining a quantized weight model with TurboQuant KV cache may offer limited practical benefit — the memory savings rarely justify the compounded quality degradation unless context length is the hard bottleneck.
-
+ 
 ### 1.1. Core Workflow: TurboQuant + IQ3_S
-
 **1. Offline Quantization:**
 The weights are transformed, quantized, and stored:
 $$\hat{\mathbf{w}} = Q(H \cdot \mathbf{w})$$
-
+ 
 **2. Online Inference:**
 The stored weights $\hat{\mathbf{w}}$ are dequantized and inverse-transformed **on-the-fly** before the matrix multiplication (with input vector $\mathbf{x}$):
 $$\mathbf{y} = (H^{-1} \cdot \hat{\mathbf{w}}) \cdot \mathbf{x} = (0.0625 \cdot H \cdot \hat{\mathbf{w}}) \cdot \mathbf{x}$$
-
+ 
 By fusing $H^{-1}$ directly into the CUDA kernel's shared memory loading stage, we achieve high-fidelity inference with virtually no speed penalty on RTX 5090.
-
+ 
 ```ascii
-Quntize: W → FWHT → quant (IQ3_S)
-Inference: dequant → IFWHT (CPU or naive GPU) → matmul
+Quantize:  W → FWHT → quant (IQ3_S)
+Inference: dequant → IFWHT (fused in CUDA kernel) → matmul
 ```
-
-### 1.2. Why ITQ3_S for Local Inference?
+ 
+### 1.2. Why Not Just Use TurboQuant Directly?
+ 
+TurboQuant establishes the theoretical foundation for FWHT-based rotation, but it has two practical blockers that make it unsuitable as-is:
+ 
+- **No native CUDA kernel.** TurboQuant has no production-ready GPU kernel implementation, so you can't actually deploy it for inference without building one from scratch.
+- **Domain mismatch when composed naively.** The tempting shortcut — applying TurboQuant only to the KV cache while leaving the weights quantized in the original domain (e.g., IQ3_S) — doesn't work well. The rotation and the quantization are operating in different domains, and the resulting mismatch errors accumulate across every transformer layer. In practice, this can push output quality *below* a plain 3-bit baseline, defeating the purpose entirely.
+ 
+ITQ3_S sidesteps both problems by co-designing the FWHT rotation and the ternary quantization kernel as a single unified pipeline: the rotation is baked directly into the IQ3_S weight format, and the inverse transform is fused into the CUDA MMQ kernel. One coherent system, no mismatch.
+ 
+### 1.3. Why ITQ3_S for Local Inference?
 - **Consumer-First Engineering**: Designed to squeeze every Teraflop and GB/s out of the RTX 5090's Blackwell architecture.
 - **Breaking the 3-bit Barrier**: Traditionally, 3-bit was the "breaking point" for model logic. ITQ3_S restores this lost intelligence through mathematical rotation.
 - **Maximum Assetization**: Empowers individual users to own and operate high-parameter models on a single-node home office setup without relying on cloud APIs.
 - **Zero-Compromise Speed**: Optimized CUDA kernels ensure that the added mathematical precision (256-point IFWHT) does not bottleneck the RTX 5090's massive throughput.
-
-### 1.3. Core Technology: TurboQuant for Local GPUs
+ 
+### 1.4. Core Technology: TurboQuant for Local GPUs
 To achieve extreme fidelity on small-scale local deployments, we focus on:
+ 
 1. **Rotation-Domain Smoothing**: Outlier weights, which usually destroy 3-bit precision, are "spread" across the vector using FWHT.
 2. **Synchronized Inference**: We implement a **256-point Inverse FWHT** directly in CUDA shared memory, ensuring the engine perfectly reverses the specialized quantization applied during model creation.
-
+ 
 ## 2. Key Features
 - **Rotation-Domain Quantization**: Minimizes outliers by transforming weights into a Gaussian-like distribution using FWHT.
 - **On-the-fly Inverse Transform**: Implements a highly optimized 256-point Inverse FWHT directly within the CUDA shared memory during the loading phase.
