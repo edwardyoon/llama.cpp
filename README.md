@@ -1,5 +1,7 @@
 # ITQ3_S: Interleaved Ternary Quantization with TurboQuant (3-bit)
 
+https://arxiv.org/abs/2603.27914
+
 ## 1. Overview
 This fork project, and **ITQ3_S** (Interleaved Ternary Quantization - Specialized) is a high-fidelity 3-bit format engineered to **maximize LLM performance on consumer-grade local hardware**, specifically targeting the **NVIDIA RTX 5090** (for my personal project). 
 
