@@ -22,7 +22,7 @@ $$\mathbf{y} = (H^{-1} \cdot \hat{\mathbf{w}}) \cdot \mathbf{x} = (0.0625 \cdot 
 By fusing $H^{-1}$ directly into the CUDA kernel's shared memory loading stage, we achieve high-fidelity inference with virtually no speed penalty on RTX 5090.
  
 ```ascii
-Quantize:  W → FWHT → quant (IQ3_S)
+Quantize:  W → FWHT → quant (ITQ3_S)
 Inference: dequant → IFWHT (fused in CUDA kernel) → matmul
 ```
  
